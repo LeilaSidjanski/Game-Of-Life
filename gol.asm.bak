@@ -1,0 +1,1399 @@
+    ;;    game state memory location
+    .equ CURR_STATE, 0x1000              ; current game state
+    .equ GSA_ID, 0x1004                  ; gsa currently in use for drawing
+    .equ PAUSE, 0x1008                   ; is the game paused or running
+    .equ SPEED, 0x100C                   ; game speed
+    .equ CURR_STEP,  0x1010              ; game current step
+    .equ SEED, 0x1014                    ; game seed
+    .equ GSA0, 0x1018                    ; GSA0 starting address
+    .equ GSA1, 0x1038                    ; GSA1 starting address
+    .equ SEVEN_SEGS, 0x1198              ; 7-segment display addresses
+    .equ CUSTOM_VAR_START, 0x1200        ; Free range of addresses for custom variable definition
+    .equ CUSTOM_VAR_END, 0x1300
+    .equ LEDS, 0x2000                    ; LED address
+    .equ RANDOM_NUM, 0x2010              ; Random number generator address
+    .equ BUTTONS, 0x2030                 ; Buttons addresses
+
+	.equ STACK1, 0x2000			  		; Stack starting address
+
+    ;; states
+    .equ INIT, 0
+    .equ RAND, 1
+    .equ RUN, 2
+
+    ;; constants
+    .equ N_SEEDS, 4
+    .equ N_GSA_LINES, 8
+    .equ N_GSA_COLUMNS, 12
+    .equ MAX_SPEED, 10
+    .equ MIN_SPEED, 1
+    .equ PAUSED, 0x00
+    .equ RUNNING, 0x01
+
+	.equ N_LEDS, 2
+	.equ N_bits, 32
+
+main:
+
+	addi sp, zero, STACK1
+	call reset_game
+	call get_input
+	addi s0, v0, 0
+	addi s1, zero, 0
+
+	while_not_done_loop:
+	addi a0, s0, 0
+	call select_action
+	addi a0, s0, 0
+	call update_state
+	call update_gsa
+	call mask
+	call draw_gsa
+	call wait
+	call decrement_step
+	addi s1, v0, 0
+	call get_input
+	addi s0, v0, 0
+	beq s1, zero, while_not_done_loop
+	br main
+
+end:
+	br end
+
+; BEGIN:clear_leds
+clear_leds:
+	stw zero, LEDS(zero)
+	stw zero, LEDS+4(zero)
+	stw zero, LEDS+8(zero)
+	ret
+; END:clear_leds
+
+; BEGIN:wait
+wait:
+	addi t0, zero, 1
+	slli t0, t0, 19		;initial counter value of 2^19
+	ldw t1, SPEED(zero)
+	
+	wait_loop:
+	sub t0, t0, t1
+	bge t0, zero, wait_loop		;while t0 is bigger than 0, loop again
+	ret
+; END:wait
+
+; BEGIN:get_gsa
+get_gsa:
+	ldw t0, GSA_ID(zero)
+	slli a0, a0, 2
+	beq t0, zero, go_to_GSA0
+	ldw v0, GSA1(a0)
+	ret
+
+	go_to_GSA0:
+	ldw v0, GSA0(a0)
+    ret
+;	END:get_gsa
+
+; BEGIN:set_gsa
+set_gsa:
+	ldw t0, GSA_ID(zero)
+	slli a1, a1, 2
+	beq t0, zero, set_GSA0
+	stw a0, GSA1(a1)
+	ret
+
+	set_GSA0:
+	stw a0, GSA0(a1)
+    ret
+
+; END:set_gsa
+
+; BEGIN:set_pixel
+set_pixel:
+	;a0 x coord"a1 y coord
+	addi sp, sp, -24
+	stw ra, 20(sp)
+	stw s0, 16(sp)
+	stw s1, 12(sp)
+	stw s2, 8(sp)
+	stw s3, 4(sp)
+	stw s4, 0(sp)
+	
+	add s0, zero, a1
+	add s1, zero, a0
+	addi s2, zero, 4
+	addi s3, zero, 8
+	addi s4, zero, 1
+
+	add t0, zero, zero		;to find the led we are on
+	blt s1, s2, findpixel
+	addi t0, zero, 4
+	blt s1, s3, findpixel
+	addi t0, t0, 4
+
+	findpixel:
+	ldw t1, LEDS(t0)
+	andi t2, s1, 3		;x mod 4
+	slli t2, t2, 3		; times nb of lines
+	add t2, t2, s0		; + y --> number of shifts to place in correct pixel
+	sll t2, s4, t2		; shifting by t2
+	or t2, t2, t1
+	stw t2, LEDS(t0)
+
+	ldw s4, 0(sp)
+	addi sp, sp, 4
+	ldw s3, 0(sp)
+	addi sp, sp, 4
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+
+	ret
+; END:set_pixel
+
+; BEGIN:draw_gsa 
+draw_gsa:
+	addi sp, sp, -24
+	stw ra, 20(sp)
+	stw s0, 16(sp)
+	stw s1, 12(sp)
+	stw s2, 8(sp)
+	stw s3, 4(sp)
+	stw s4, 0(sp) 	
+
+	add a0, zero, zero
+	addi s0, zero, 1				; s0 stores the 0000...001 word that we will "AND" to get only lsb of GSA word
+	add s1, zero, zero 				; reset value for t2 when we are done with one LED
+	addi s2, zero, 32				; change LEDS value
+	addi s3, zero, 8				; s3 stores 0, 4 or 8
+	addi s4, zero, N_GSA_COLUMNS	;s4 stores 12
+
+	add t2, zero, zero				; t2 stores the current shift state for bit we will "OR" with GSA word (0, 8, 16, 24 and at 32 it goes back to 0)
+	
+	call push_draw_gsa
+	call clear_leds
+	call pop_draw_gsa
+	
+	get_next_GSA_word:		;outer loop (increment y)
+	call push_draw_gsa
+	call get_gsa
+	call pop_draw_gsa
+
+	add t3, zero, zero		; t3 stores 0 for first loop and then 1 (it shifts our gsa word by 1 every time we call update leds)
+	add t0, v0, zero		; t0 stores the GSA current word
+	add t4, zero, zero		;we are in LEDS0 at the beginning
+
+	update_leds:
+	and t1, t0, s0			; t1 stores the lsb of GSA word
+	sll t1, t1, t2			;shift t1 by t2
+	bge t2, s2, change_LEDS_offset		; if t2 > 31 we go to next LED
+	ldw t5, LEDS(t4)		;load content of LEDS into t5
+	or t1, t5, t1			;update t1 --> becomes t1 or (led content)
+	stw t1, LEDS(t4)		;update leds
+	addi t2, t2, 8			;increment t2 by 8
+	addi t3, zero, 1		; t3 = 1
+	srl t0, t0, t3			; always shift the GSA word by 1 to look at next bit and update leds 
+	br update_leds
+
+	change_LEDS_offset:
+	add t2, s1, zero
+	beq t4, s3, increment_a0 
+	addi t4, t4, 4			; we are on LEDS
+	br update_leds
+
+	increment_a0:
+	addi a0, a0, 1			;incrementing y coordinate
+	addi s1, s1, 1
+	add t2, zero, s1
+	bne a0, s3, get_next_GSA_word
+	br fin_draw_gsa
+
+	push_draw_gsa:
+	addi sp, sp, -28
+	stw t0, 24(sp)
+	stw t1, 20(sp)
+	stw t2, 16(sp)
+	stw t3, 12(sp)
+	stw t4, 8(sp)
+	stw t5, 4(sp)
+	stw a0, 0(sp)
+	ret
+
+	pop_draw_gsa:
+	ldw a0, 0(sp)
+	addi sp, sp, 4
+	ldw t5, 0(sp)
+	addi sp, sp, 4
+	ldw t4, 0(sp)
+	addi sp, sp, 4
+	ldw t3, 0(sp)
+	addi sp, sp, 4
+	ldw t2, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t0, 0(sp)
+	addi sp, sp, 4
+	ret
+	
+	fin_draw_gsa:
+	ldw s4, 0(sp)
+	addi sp, sp, 4
+	ldw s3, 0(sp)
+	addi sp, sp, 4
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+
+	ret 					;we are done setting all the leds (a0 = 8)
+
+	
+; END:draw_gsa
+	
+; BEGIN:random_gsa
+random_gsa:
+	addi sp, sp, -12
+	stw s0, 8(sp)
+	stw s1, 4(sp)
+	stw s2, 0(sp)
+
+	addi s0, zero, N_GSA_LINES
+	addi s1, zero, N_bits
+	addi s2, zero, 1
+
+	addi t0, zero, 0		;GSA line counter
+	
+	GSA_word_loop:
+	addi t1, zero, 0		;bit we are setting counter
+	add t3, zero, zero		;t3 holds the current GSA random word we are going to set
+
+	GSA_bit_loop:
+	ldw t2, RANDOM_NUM(zero)
+	;addi t2, zero, 7
+	and t2, t2, s2
+	sll t2, t2, t1
+	or t3, t3, t2
+	addi t1, t1, 1
+	bne t1, s1, GSA_bit_loop
+	
+	add a0, zero, t3
+	add a1, zero, t0
+
+	addi sp, sp, -20
+	stw ra, 16(sp)
+	stw t0, 12(sp)
+	stw t1, 8(sp)
+	stw t2, 4(sp)
+	stw t3, 0(sp)
+
+	call set_gsa
+
+	ldw t3, 0(sp)
+	addi sp, sp, 4
+	ldw t2, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+
+	;if t1 = 32 we are done with the GSA random word and we want to randomize the next one
+	addi t0, t0, 1
+	bne t0, s0, GSA_word_loop
+
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4	
+
+    ret
+; END:random_gsa
+
+; BEGIN:change_speed
+change_speed:
+	ldw t0, SPEED(zero)
+	addi t1, zero, MAX_SPEED
+	addi t2, zero, MIN_SPEED
+	beq a0, zero, increment_speed
+	
+	beq t2, t0, fin_change_speed
+	sub t0, t0, t2
+	stw t0, SPEED(zero)
+	br fin_change_speed
+
+	increment_speed:
+	beq t0, t1, fin_change_speed
+	addi t0, t0, 1
+	stw t0, SPEED(zero)
+		
+	fin_change_speed:
+	ret
+
+; END:change_speed
+
+; BEGIN:pause_game
+pause_game:
+	ldw t0, PAUSE(zero)
+	xori t0, t0, 1
+	stw t0, PAUSE(zero)
+
+	ret
+; END:pause_game
+
+; BEGIN:change_steps
+change_steps:
+
+	addi sp, sp, -8
+	stw s0, 4(sp)
+	stw s1, 0(sp)
+
+	addi s0, zero, 1
+	addi s1, zero, 4095			;FFF in binary
+
+	ldw t0, CURR_STEP(zero)	
+
+	beq a0, s0, update_units
+	beq a1, s0, update_tens
+	beq a2, s0, update_hundreds
+	br fin_change_steps
+
+	update_units:
+	addi t0, t0, 1
+	beq a1, s0, update_tens
+	beq a2, s0, update_hundreds
+	bge t0, s1, curr_step_zero
+	stw t0, CURR_STEP(zero)
+	br fin_change_steps
+
+	update_tens:
+	addi t0, t0, 16
+	beq a2, s0, update_hundreds
+	bge t0, s1, curr_step_zero
+	stw t0, CURR_STEP(zero)
+	br fin_change_steps
+
+	update_hundreds:
+	addi t0, t0, 256
+	bge t0, s1, curr_step_zero
+	stw t0, CURR_STEP(zero)
+	br fin_change_steps
+	
+	curr_step_zero:
+	add t0, zero, zero
+	stw t0, CURR_STEP(zero)
+
+	fin_change_steps:
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+
+	ret
+; END:change_steps
+
+; BEGIN:increment_seed
+increment_seed:
+	
+	;first we get the value of SEED in RAM, if the seed is strictly smaller than 4 and we are in state INIT, we increment seed by 1 and and the corresponding new seed with its mask.
+	;if we are in RAND or our register containing the new seed value is bigger or equal to 4, we set the SEED in the RAM to 4 and we call random_gsa and set a new gsa accordingly (call get gsa)	
+
+	addi sp, sp, -24
+	stw ra, 20(sp)
+	stw s0, 16(sp)
+	stw s1, 12(sp)
+	stw s2, 8(sp)
+	stw s3, 4(sp)
+	stw s4, 0(sp)
+
+	addi s0, zero, 4
+	addi s1, zero, 1
+	addi s2, zero, 2
+	addi s3, zero, 3
+	addi s4, zero, N_GSA_LINES
+
+	add a1, zero, zero			;a1 goes from 0 to 7
+
+	ldw t0, CURR_STATE(zero)
+	addi t1, zero, INIT
+	beq t0, t1, state_init
+	addi t1, zero, RAND
+	beq t0, t1, state_rand
+	br fin_increment_seed
+
+	state_init:
+	ldw t2, SEED(zero)
+	addi t2, t2, 1
+	blt t2, s0, seed_store
+	beq t2, s0, state_rand
+
+	state_rand:
+	stw s0, SEED(zero)
+	call push_increment_seed
+	call random_gsa
+	call pop_increment_seed
+	br fin_increment_seed
+
+	seed_store:
+	stw t2, SEED(zero)
+	beq zero, t2, seed0_address
+	beq s1, t2, seed1_address
+	beq s2, t2, seed2_address
+	beq s3, t2, seed3_address
+	
+	seed0_address:
+	addi t1, zero, seed0
+	br display_seed
+
+	seed1_address:
+	addi t1, zero, seed1
+	br display_seed
+
+	seed2_address:
+	addi t1, zero, seed2
+	br display_seed
+
+	seed3_address:
+	addi t1, zero, seed3
+	
+	display_seed:
+	slli t0, a1, 2			;t1 stores the offset for seed address (we multiply by 4 each loop)
+	add a0, t1, t0			;a0 stores the address of seed word + offset
+	ldw a0, 0(a0)			;a0 has the specific seed word
+	call push_increment_seed
+	call set_gsa
+	call pop_increment_seed
+	addi a1, a1, 1
+	bne a1, s4, display_seed
+	br fin_increment_seed
+
+	push_increment_seed:
+	addi sp, sp, -12
+	stw t0, 8(sp)
+	stw t1, 4(sp)
+	stw a1, 0(sp)
+	ret
+	
+	pop_increment_seed:
+	ldw a1, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t0, 0(sp)
+	addi sp, sp, 4
+	ret
+
+	fin_increment_seed:
+	ldw s4, 0(sp)
+	addi sp, sp, 4
+	ldw s3, 0(sp)
+	addi sp, sp, 4
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	
+	ret
+
+; END:increment_seed
+
+; BEGIN:update_state
+update_state:
+	addi sp, sp, -16
+	stw s0, 12(sp)
+	stw s1,8(sp)	
+	stw s2, 4(sp)
+	stw s4, 0(sp)
+
+	addi s0, zero, N_SEEDS		;N = 4
+	ldw s1, SEED(zero)			;load seed value
+	addi s2, zero, 1			;mask 0000....001 (used to get lsb of edgecapture)
+	add t0, zero, a0			;edgecapture
+	
+	and t2, t0, s2				;get b0 (button on far left on gecko)
+	srli t0, t0, 1				;shifting edgecapture
+	and t3, t0, s2				;get b1
+	srli t0, t0, 1				;shifting edgecapture
+	and t4, t0, s2				;get b2
+	srli t0, t0, 1				;shifting edgecapture
+	and t5, t0, s2				;get b3
+	srli t0, t0, 1				;shifting edgecapture
+	and t6, t0, s2				;get b4
+	;registers t2...t6 hold values for buttons b0...b4
+
+	ldw s4, CURR_STATE(zero)	;either INIT, RAND, RUN
+	addi t7, zero, INIT 
+	beq s4, t7, INIT_STATE
+	addi t7, zero, RAND
+	beq s4, t7, RAND_STATE
+	
+	;RUN state
+	beq t5, s2, RUN_TO_INIT
+	ldw t7, CURR_STEP(zero)
+	beq t7, zero, RUN_TO_INIT
+	br fin_update_state
+
+	INIT_STATE:
+	ldw t7, SEED(zero)
+	beq t2, zero, CHECK_INIT_TO_RUN
+	beq t7, s0, INIT_TO_RAND
+	br fin_update_state
+
+	CHECK_INIT_TO_RUN:
+	beq t3, s2, RAND_INIT_TO_RUN
+	br fin_update_state
+
+	RAND_STATE:
+	beq t3, s2, RAND_INIT_TO_RUN
+	br fin_update_state
+
+	RAND_INIT_TO_RUN:
+	addi t7, zero, RUN
+	stw t7, CURR_STATE(zero)
+	addi t7, zero, RUNNING
+	stw t7, PAUSE(zero)			;starts the game
+	br fin_update_state
+
+	INIT_TO_RAND:
+	addi t7, zero, RAND
+	stw t7, CURR_STATE(zero)
+	br fin_update_state
+	
+	RUN_TO_INIT:
+	addi t7, zero, INIT
+	stw t7, CURR_STATE(zero)
+	br RESET_call
+	
+	RESET_call:
+	addi sp, sp, -36
+	stw ra, 32(sp)
+	stw t0, 28(sp)
+	stw t1, 24(sp)
+	stw t2, 20(sp)
+	stw t3, 16(sp)
+	stw t4, 12(sp)
+	stw t5, 8(sp)
+	stw t6, 4(sp)
+	stw t7, 0(sp)
+
+	call reset_game
+
+	ldw t7, 0(sp)
+	addi sp, sp, 4
+	ldw t6, 0(sp)
+	addi sp, sp, 4
+	ldw t5, 0(sp)
+	addi sp, sp, 4
+	ldw t4, 0(sp)
+	addi sp, sp, 4
+	ldw t3, 0(sp)
+	addi sp, sp, 4
+	ldw t2, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+
+	fin_update_state:
+	ldw s4, 0(sp)
+	addi sp, sp, 4
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	
+	ret
+; END:update_state
+
+; BEGIN:select_action
+select_action:
+	addi sp, sp, -8
+	stw s0, 4(sp)
+	stw ra, 0(sp)
+
+	addi s0, zero, 1			;mask 0000....001 (used to get lsb of edgecapture)
+	add t0, zero, a0			;edgecapture
+
+	and t1, t0, s0				;get b0
+	srli t0, t0, 1				;shifting edgecapture
+	and t2, t0, s0				;get b1
+	srli t0, t0, 1				;shifting edgecapture
+	and t3, t0, s0				;get b2
+	srli t0, t0, 1				;shifting edgecapture
+	and t4, t0, s0				;get b3
+	srli t0, t0, 1				;shifting edgecapture
+	and t5, t0, s0				;get b4
+	;registers t1...t5 hold values for buttons b0...b4
+
+	ldw t0, CURR_STATE(zero)
+	addi t6, zero, INIT
+	beq t0, t6, init_actions
+	addi t6, zero, RAND
+	beq t0, t6, rand_actions
+										;RUN state
+	beq t1, s0, toggle_pause_game
+	beq t2, s0, incr_decr_speed_game
+	beq t3, s0, incr_decr_speed_game
+	beq t5, s0, random_game_gsa
+	br fin_select_actions
+
+	toggle_pause_game:				;toggle pause
+	call push_select_actions
+	call pause_game	
+	call pop_select_actions
+	beq t2, s0, incr_decr_speed_game
+	beq t3, s0, incr_decr_speed_game
+	beq t5, s0, random_game_gsa
+	br fin_select_actions
+	
+	incr_decr_speed_game:			;increment or decrement speed of game
+	cmpeqi a0, t3, 1
+	call push_select_actions
+	call change_speed	
+	call pop_select_actions
+	beq t5, s0, random_game_gsa
+	br fin_select_actions
+
+	random_game_gsa:				;replace current game state with a new random one
+	call push_select_actions
+	call random_gsa
+	call pop_select_actions
+	br fin_select_actions
+
+	rand_actions:					;RAND state
+	beq t1, s0, random_game_gsa
+	beq t3, s0, set_LCD_display
+	beq t4, s0, set_LCD_display
+	beq t5, s0, set_LCD_display
+	;button 1 pressed is taken care of in update_state
+	br fin_select_actions
+
+	set_LCD_display:				;set LCD
+	addi a0, t5, 0
+	addi a1, t4, 0
+	addi a2, t3, 0
+	call push_select_actions
+	call change_steps
+	call pop_select_actions
+	br fin_select_actions
+	
+	init_actions:					;INIT state
+	beq t1, s0, go_through_seeds
+	;button 1 pressed is taken care of in update_state
+	beq t3, s0, set_LCD_display
+	beq t4, s0, set_LCD_display
+	beq t5, s0, set_LCD_display
+	br fin_select_actions
+
+	go_through_seeds:				;next seed
+	call push_select_actions
+	call increment_seed
+	call pop_select_actions
+	beq t3, s0, set_LCD_display
+	beq t4, s0,set_LCD_display
+	beq t5, s0, set_LCD_display
+	br fin_select_actions	
+	
+	push_select_actions:			;push
+	addi sp, sp, -20
+	stw t1, 16(sp)
+	stw t2, 12(sp)
+	stw t3, 8(sp)
+	stw t4, 4(sp)
+	stw t5, 0(sp)
+	ret
+
+	pop_select_actions:				;pop
+	ldw t5, 0(sp)
+	addi sp, sp, 4
+	ldw t4, 0(sp)
+	addi sp, sp, 4
+	ldw t3, 0(sp)
+	addi sp, sp, 4
+	ldw t2, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ret
+
+	fin_select_actions:	
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	
+	ret
+; END:select_action
+
+; BEGIN:mask
+mask:
+	addi sp, sp, -24
+	stw ra, 20(sp)
+	stw s0, 16(sp)
+	stw s1, 12(sp)
+	stw s2, 8(sp)
+	stw s3, 4(sp)
+	stw s4, 0(sp)
+
+	addi s0, zero, N_GSA_LINES
+	addi s1, zero, 1
+	addi s2, zero, 2
+	addi s3, zero, 3
+	addi s4, zero, 4
+
+	add t4, zero, zero			;line counter between 0 and 7
+	
+	ldw t0, SEED(zero)
+	beq zero, t0, seedmask0_addresses
+	beq s1, t0, seedmask1_addresses
+	beq s2, t0, seedmask2_addresses
+	beq s3, t0, seedmask3_addresses
+	beq t0, s4, seedmask4_addresses
+
+	seedmask0_addresses:
+	addi t2, zero, mask0
+	br maskseed_and
+
+	seedmask1_addresses:
+	addi t2, zero, mask1
+	br maskseed_and
+
+	seedmask2_addresses:
+	addi t2, zero, mask2
+	br maskseed_and
+
+	seedmask3_addresses:
+	addi t2, zero, mask3
+	br maskseed_and
+
+	seedmask4_addresses:
+	addi t2, zero, mask4
+	
+	maskseed_and:
+	add a0, zero, t4
+	call push_mask
+	call get_gsa
+	call pop_mask	
+
+	slli t0, t4, 2			; multiplying by 4
+	add t5, t2, t0
+	ldw t5, 0(t5)
+	and t5, t5, v0			;mask corresponding to the seed and gsa word
+	
+	add a0, zero, t5
+	add a1, zero, t4
+
+	call push_mask
+	call set_gsa
+	call pop_mask
+	
+	addi t4, t4, 1
+	bne t4, s0, maskseed_and
+	br fin_seedmask
+
+	push_mask:
+	addi sp, sp, -24
+	stw t0, 20(sp)
+	stw t1, 16(sp)
+	stw t2, 12(sp)
+	stw t3, 8(sp)
+	stw t4, 4(sp)
+	stw t5, 0(sp)
+	ret
+
+	pop_mask:
+	ldw t5, 0(sp)
+	addi sp, sp, 4
+	ldw t4, 0(sp)
+	addi sp, sp, 4
+	ldw t3, 0(sp)
+	addi sp, sp, 4
+	ldw t2, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t0, 0(sp)
+	addi sp, sp, 4
+	ret
+	
+	fin_seedmask:
+	ldw s4, 0(sp)
+	addi sp, sp, 4
+	ldw s3, 0(sp)
+	addi sp, sp, 4
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+
+	ret
+; END:mask
+
+; BEGIN:reset_game
+reset_game:
+	addi sp, sp, -4
+	stw ra, 0(sp)
+
+	addi t0, zero, 1
+	stw t0, CURR_STEP(zero)			;current step = 1
+	ldw t0, font_data(zero)
+	stw t0, SEVEN_SEGS(zero)	
+	stw t0, SEVEN_SEGS+4(zero)
+	stw t0, SEVEN_SEGS+8(zero)
+	ldw t0, font_data+4(zero)
+	stw t0, SEVEN_SEGS+12(zero)
+
+	stw zero, GSA_ID(zero)			;GSA_ID = 0
+
+	addi t0, zero, INIT
+	stw t0, CURR_STATE(zero) 		;current state = INIT
+
+	stw zero, SEED(zero)			; seed = seed0
+
+	addi t1, zero, seed0
+	addi t2, zero, mask0
+	add t4, zero, zero
+	addi t6, zero, N_GSA_LINES
+
+	mask0seed0_and:
+	slli t0, t4, 2			;t0 stores the offset for seed address (we multiply by 4 each loop)
+	add t3, t1, t0			;t3 stores the adress of the word in corresponding seed we want to look at + offset
+	ldw t3, 0(t3)
+	add t5, t2, t0
+	ldw t5, 0(t5)
+	and t5, t5, t3			;mask corresponding to the seed
+	
+	add a0, zero, t5
+	add a1, zero, t4
+
+	addi sp, sp, -16
+	stw t6, 12(sp)
+	stw t4, 8(sp)
+	stw t2, 4(sp)
+	stw t1, 0(sp) 
+	call set_gsa
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t2, 0(sp)
+	addi sp, sp, 4
+	ldw t4, 0(sp)
+	addi sp, sp, 4
+	ldw t6, 0(sp)
+	addi sp, sp, 4
+	
+	addi t4, t4, 1
+	bne t4, t6, mask0seed0_and
+
+	call draw_gsa					;draw content of GSA0 on LEDS
+
+	stw zero, PAUSE(zero)			;pause_game = 0 (game is paused)
+
+	addi t0, zero, MIN_SPEED		
+	stw t0, SPEED(zero)				;speed is min speed
+
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	
+	ret
+; END:reset_game
+
+; BEGIN:get_input
+get_input:
+	ldw v0, BUTTONS+4(zero)
+	stw zero, BUTTONS+4(zero)
+	ret
+
+; END:get_input
+	
+; BEGIN:decrement_step
+decrement_step:
+	addi sp, sp, -16
+	stw s0, 12(sp)
+	stw s1, 8(sp)
+	stw s2, 4(sp)
+	stw s3, 0(sp)	
+
+	ldw s0, CURR_STATE(zero)		;s0 is either RUN, RAND or INIT
+	ldw s1, PAUSE(zero)
+	addi s2, zero, RUNNING
+	addi s3, zero, 15			;creating 000..1111 mask
+
+	addi t0, zero, INIT
+	beq s0, t0, display_steps_procedure_INIT_RAND
+	addi t0, zero, RAND
+	beq s0, t0, display_steps_procedure_INIT_RAND
+	;we are in RUN state
+	beq s1, s2, check_current_step		;if we are in RUN and game state is paused, we check current step
+	br display_steps_procedure_INIT_RAND	
+
+	check_current_step:
+	ldw t0, CURR_STEP(zero)		;get current step we will display on leds
+	cmpeq t4, t0, zero			;if current step (t0) is = 0 then we store 1 in t4 and then return it in v0, else we return 0 in v0
+	add v0, zero, t4
+	bne t4, zero, fin_decrement_step	;if t4 (=v0) is 0, then we don't want to display anything else on LEDS
+	addi t0, t0, -1						;decrement number of steps
+	stw t0, CURR_STEP(zero)
+	br display_steps_procedure
+
+	display_steps_procedure_INIT_RAND:
+	add v0, zero, zero
+	ldw t0, CURR_STEP(zero)
+
+	display_steps_procedure:
+	and t1, s3, t0				;we are going to AND the cur step and mask to get 4 last bits (digit value for seven segs digit led)
+	slli t1, t1, 2				;multiply value by 4 to get address in font data
+	ldw t2, font_data(t1)
+	stw t2, SEVEN_SEGS+12(zero)
+
+	srli t1, t0, 4				;shift right cur step to get the next 4 bits that represent the tens
+	and t1, s3, t1
+	slli t1, t1, 2
+	ldw t2, font_data(t1)
+	stw t2, SEVEN_SEGS+8(zero)
+
+	srli t1, t0, 8
+	and t1, s3, t1
+	slli t1, t1, 2
+	ldw t2, font_data(t1)
+	stw t2, SEVEN_SEGS+4(zero)
+
+	ldw t2, font_data(zero)
+	stw t2, SEVEN_SEGS(zero)
+	
+	
+	fin_decrement_step:
+	ldw s3, 0(sp)
+	addi sp, sp, 4
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+
+	ret
+
+; END:decrement_step
+
+; BEGIN:cell_fate
+cell_fate:
+	beq a1, zero, check_back_to_life
+	
+	;cell alive
+	addi t0, zero, 2
+	blt a0, t0, kill_cell
+	addi t0, zero, 4
+	bge a0, t0, kill_cell
+	addi v0, zero, 1
+	ret
+
+	kill_cell:
+	addi v0, zero, 0
+	ret
+
+	check_back_to_life:
+	addi t0, zero, 3
+	beq a0, t0, back_to_life
+	addi v0, zero, 0
+	ret
+
+	back_to_life:
+	addi v0, zero, 1
+	ret		
+; END:cell_fate
+
+; BEGIN:find_neighbours
+find_neighbours:
+	addi sp, sp, -24	
+	stw ra, 20(sp)
+	stw s0, 16(sp)
+	stw s1, 12(sp)
+	stw s2, 8(sp)
+	stw s3, 4(sp)
+	stw s4, 0(sp)
+	
+	add s0, zero, a0				;s0 stores the x-coordinate(0..11)
+	add s1, zero, a1				;s1 stores the y-coordinate (0..7)
+	addi s2, zero, N_GSA_LINES		;8
+	addi s3, zero, N_GSA_COLUMNS	;12
+	addi s4, zero, 1
+	addi t0, zero, 0				;counter tha counts number of alive neighbours
+
+	add a0, zero, s1
+	call get_gsa_procedure_1
+	
+	addi a0, s1, 1						;y+1
+	beq a0, s2, change_y_upper_bound
+	call get_gsa_procedure_2
+	br yminus1_procedure
+
+	change_y_upper_bound:
+	add a0, zero, zero
+	call get_gsa_procedure_2
+
+	yminus1_procedure:
+	addi a0, s1, -1
+	blt a0, zero, change_y_lower_bound
+	call get_gsa_procedure_2
+	br fin_find_neighbours
+	
+	change_y_lower_bound:
+	addi a0, s2, -1					; 7
+	call get_gsa_procedure_2
+	br fin_find_neighbours 
+	
+	get_gsa_procedure_2:
+	add t1, zero, s0
+	addi sp, sp, -4
+	stw ra, 0(sp)
+	call increment_counter
+	call get_gsa_procedure_1
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	ret
+
+	get_gsa_procedure_1:				;takes care of (x+1) and (x-1)
+	addi t1, s0, 1						;x+1
+	addi sp, sp, -4
+	stw ra, 0(sp)
+	beq t1, s3, change_x_upper_bound
+	call increment_counter
+	br xminus1_procedure
+
+	change_x_upper_bound:
+	addi t1, zero, 0
+	call increment_counter
+
+	xminus1_procedure:
+	addi t1, s0, -1						;x-1
+	blt t1, zero, change_x_lower_bound
+	call increment_counter
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	ret
+
+	change_x_lower_bound:
+	addi t1, s3, -1						;change t1 to 11
+	call increment_counter
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	ret
+	
+	increment_counter:
+	addi sp, sp, -4
+	stw ra, 0(sp)
+	call push_find_neighbours
+	call get_gsa
+	call pop_find_neighbours
+	sll t2, s4, t1						;shift left 000..001 bit by (x+1) or (x-1)
+	and t2, v0, t2						;now t1 tells us if the cell at location .. is dead or alive
+	srl t2, t2, t1						;shift right 00..1..00 bit by (x+1) or (x-1)
+	cmpeqi t2, t2, 1
+	add t0, t0, t2						;t2 is either 1 (cell alive) or 0
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	ret 
+
+	push_find_neighbours:
+	addi sp, sp, -12
+	stw t0, 8(sp)
+	stw t1, 4(sp)
+	stw a0, 0(sp)
+	ret
+
+	pop_find_neighbours:
+	ldw a0, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t0, 0(sp)
+	addi sp, sp, 4
+	ret
+
+	fin_find_neighbours:
+	add a0, zero, s1
+	call push_find_neighbours
+	call get_gsa
+	call pop_find_neighbours
+	sll t2, s4, s0
+	and t2, t2, v0
+	srl t2, t2, s0
+	add v1, zero, t2
+	add v0, zero, t0
+
+	ldw s4, 0(sp)
+	addi sp, sp, 4
+	ldw s3, 0(sp)
+	addi sp, sp, 4
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	
+	ret
+
+; END:find_neighbours
+
+	
+; BEGIN:update_gsa
+update_gsa:
+	addi sp, sp, -16
+	stw ra, 12(sp)
+	stw s0, 8(sp)
+	stw s1, 4(sp)
+	stw s2, 0(sp)
+
+	ldw t0, PAUSE(zero)
+	addi t1, zero, PAUSED
+	beq t0, t1, fin_update_gsa
+
+	addi s0, zero, 1				; 000..001 word we use for anding
+	addi s1, zero, N_GSA_COLUMNS	;12
+	addi s2, zero, N_GSA_LINES		;8
+
+	addi t0, zero, 0				;counter y coordinate
+	addi t3, zero, 0
+
+	get_next_gsa_word:
+	addi t1, zero, 0				;counter x coordinate
+	addi t3, zero, 0
+	addi a0, t0, 0
+	call push_update_gsa
+	call get_gsa
+	call pop_update_gsa
+	
+	update_gsa_loop:
+	sll t2, s0, t1
+	and t2, t2, v0
+	srl t2, t2, t1
+	add a0, zero, t1
+	add a1, zero, t0
+	call push_update_gsa
+	call find_neighbours
+	call pop_update_gsa
+	add a0, zero, v0				;a0 stores number of living neighbours
+	add a1, zero, v1
+	call push_update_gsa
+	call cell_fate
+	call pop_update_gsa
+	sll t2, v0, t1					;t3 stores the current gsa word that we will use to or with next gsa bits
+	or t3, t3, t2
+	addi t1, t1, 1
+	bne t1, s1, update_gsa_loop
+	addi sp, sp, -4
+	stw t3, 0(sp)					;push gsa word to stack
+	addi t0, t0, 1
+	bne t0, s2, get_next_gsa_word
+	addi t0, zero, 7
+
+	ldw t1, GSA_ID(zero)
+	xori t1, t1, 1
+	stw t1, GSA_ID(zero)
+	
+	pop_gsa_words:
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	add a0, zero, t1
+	add a1, zero, t0
+	call push_update_gsa
+	call set_gsa
+	call pop_update_gsa
+	addi t0, t0, -1
+	bge t0, zero, pop_gsa_words
+
+	fin_update_gsa:
+	ldw s2, 0(sp)
+	addi sp, sp, 4
+	ldw s1, 0(sp)
+	addi sp, sp, 4
+	ldw s0, 0(sp)
+	addi sp, sp, 4
+	ldw ra, 0(sp)
+	addi sp, sp, 4
+	ret
+
+	push_update_gsa:
+	addi sp, sp, -12
+	stw t0, 8(sp)
+	stw t1, 4(sp)
+	stw t3, 0(sp)
+	ret
+
+	pop_update_gsa:
+	ldw t3, 0(sp)
+	addi sp, sp, 4
+	ldw t1, 0(sp)
+	addi sp, sp, 4
+	ldw t0, 0(sp)
+	addi sp, sp, 4
+	ret
+	
+
+
+; END:update_gsa
+
+font_data:
+    .word 0xFC ; 0
+    .word 0x60 ; 1
+    .word 0xDA ; 2
+    .word 0xF2 ; 3
+    .word 0x66 ; 4
+    .word 0xB6 ; 5
+    .word 0xBE ; 6
+    .word 0xE0 ; 7
+    .word 0xFE ; 8
+    .word 0xF6 ; 9
+    .word 0xEE ; A
+    .word 0x3E ; B
+    .word 0x9C ; C
+    .word 0x7A ; D
+    .word 0x9E ; E
+    .word 0x8E ; F
+
+seed0:
+    .word 0xC00
+    .word 0xC00
+    .word 0x000
+    .word 0x060
+    .word 0x0A0
+    .word 0x0C6
+    .word 0x006
+    .word 0x000
+
+seed1:
+    .word 0x000
+    .word 0x000
+    .word 0x05C
+    .word 0x040
+    .word 0x240
+    .word 0x200
+    .word 0x20E
+    .word 0x000
+
+seed2:
+    .word 0x000
+    .word 0x010
+    .word 0x020
+    .word 0x038
+    .word 0x000
+    .word 0x000
+    .word 0x000
+    .word 0x000
+
+seed3:
+    .word 0x000
+    .word 0x000
+    .word 0x090
+    .word 0x008
+    .word 0x088
+    .word 0x078
+    .word 0x000
+    .word 0x000
+
+    ;; Predefined seeds
+SEEDS:
+    .word seed0
+    .word seed1
+    .word seed2
+    .word seed3
+
+mask0:
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+
+mask1:
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0x1FF
+	.word 0x1FF
+	.word 0x1FF
+
+mask2:
+	.word 0x7FF
+	.word 0x7FF
+	.word 0x7FF
+	.word 0x7FF
+	.word 0x7FF
+	.word 0x7FF
+	.word 0x7FF
+	.word 0x7FF
+
+mask3:
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0x000
+
+mask4:
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0xFFF
+	.word 0x000
+
+MASKS:
+    .word mask0
+    .word mask1
+    .word mask2
+    .word mask3
+    .word mask4
+
+
+
+	
+
+
+
+
+
+
+
+
+
+
+
